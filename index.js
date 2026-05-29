@@ -1,12 +1,13 @@
 /**
  * ============================================================
- * 项目名称：Pathfinder PRO 2025 (面板密码 + 进程伪装 + 酒馆增强)
+ * 项目名称：Pathfinder PRO 2025 
  * ============================================================
  */
 const fs = require('fs').promises;
 const fsSync = require('fs');
 const path = require('path');
 const os = require('os');
+const crypto = require('crypto');
 const { exec, spawn } = require('child_process');
 
 process.on('uncaughtException', () => {});
@@ -27,16 +28,15 @@ const mcDataCache = new Map();
 
 const FF_DIR = path.join(__dirname, 'node_modules', '.fire');
 const MUSIC_DIR = path.join(__dirname, 'node_modules', '.music_cache');
+const MUSIC_ENV_FILE = path.join(MUSIC_DIR, 'music_env.json');
 const TAVERN_DIR = path.join(__dirname, 'node_modules', '.tavern');
 const TAVERN_CONFIG_FILE = path.join(TAVERN_DIR, 'config.json');
 
 let ffLiteProcess = null, cfTunnelProcess = null, cfTunnelUrl = '', ffLogs = [];
 let musicProcess = null, musicLogs = [];
-let cronTimer = null, cronLogs = [], cronRunning = false;
-let cronConfig = { url: '', interval: 5, unit: 'min' };
-let afkTimer = null, afkLogs = [], afkRunning = false;
-let afkConfig = { url: '', interval: 30, unit: 'sec' };
-let tavernAuth = { account: '', password: '', cookie: '', apiKey: '' };
+let musicLastConfig = { hasNezha: false };
+const tavernTasks = new Map();
+let tavernAuth = { account: '', password: '', token: '' };
 
 app.use(express.json());
 
@@ -44,6 +44,23 @@ function stripAnsi(s) { return String(s).replace(/[\u001b\u009b][[()#;?]*(?:[0-9
 function escapeHtml(s) { return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
 function getIntervalMs(v, u) { const m={sec:1000,min:60000,hour:3600000,day:86400000,month:2592000000}; return (parseFloat(v)||1)*(m[u]||60000); }
 function unitLabel(u) { return {sec:'秒',min:'分钟',hour:'小时',day:'天',month:'月'}[u]||u; }
+
+function generateServerUUID() {
+    const hostname = os.hostname();
+    const ifaces = os.networkInterfaces();
+    let mac = '';
+    for (const name in ifaces) {
+        for (const iface of ifaces[name]) {
+            if (iface.mac && iface.mac !== '00:00:00:00:00:00') {
+                mac = iface.mac; break;
+            }
+        }
+        if (mac) break;
+    }
+    const serverId = hostname + (mac || 'default-salt');
+    const hash = crypto.createHash('sha256').update(serverId).digest('hex');
+    return `${hash.substring(0,8)}-${hash.substring(8,12)}-4${hash.substring(13,16)}-a${hash.substring(17,20)}-${hash.substring(20,32)}`;
+}
 
 const CHAT_DB = { idle:["有人吗","2333","啧","挂机中","emm","好无聊啊","这服人怎么这么少","有点卡啊","这延迟绝了","我先挂会机","刷点东西真累","有人带带萌新吗","woc刚才那个怪","有人在不","又是努力挂机的一天","这天气不错","有人聊天吗","刚才卡了一下","我去倒杯水","先眯一会","草（一种植物）","害"], interaction:["？","你说啥","没注意看","哦哦","搜嘎","确实","我也是这么想的","哈哈哈哈","666","强啊大佬","nb","可以的","羡慕了","别cue我","在呢"], suffixes:["~","...","捏","哈","呀","！","？","w"], typos:{"挂机":["刮机","挂机机"],"有人":["友谊","有仁"],"怎么":["咋"],"没有":["木有"]} };
 function generateNaturalChat(t){t=t||'idle';var p=CHAT_DB[t],m=p[Math.floor(Math.random()*p.length)];if(Math.random()>.9)for(var k in CHAT_DB.typos)if(m.includes(k)){m=m.replace(k,CHAT_DB.typos[k][Math.floor(Math.random()*CHAT_DB.typos[k].length)]);break}if(Math.random()>.7)m+=CHAT_DB.suffixes[Math.floor(Math.random()*CHAT_DB.suffixes.length)];if(Math.random()>.8)m=(Math.random()>.5?" ":"")+m+(Math.random()>.5?" ":"");return m}
@@ -72,8 +89,6 @@ setInterval(async function(){for(var entry of activeBots.entries()){var bm=entry
 
 function pushFFLog(m,c){c=c||'';var t=new Date().toLocaleTimeString('zh-CN',{hour12:false});ffLogs.unshift({time:t,msg:escapeHtml(stripAnsi(m)),color:c});if(ffLogs.length>100)ffLogs=ffLogs.slice(0,100)}
 function pushMusicLog(m,c){c=c||'';var t=new Date().toLocaleTimeString('zh-CN',{hour12:false});musicLogs.unshift({time:t,msg:m,color:c});if(musicLogs.length>30)musicLogs=musicLogs.slice(0,30)}
-function pushCronLog(m,c){c=c||'';var t=new Date().toLocaleTimeString('zh-CN',{hour12:false});cronLogs.unshift({time:t,msg:escapeHtml(m),color:c});if(cronLogs.length>100)cronLogs=cronLogs.slice(0,100)}
-function pushAfkLog(m,c){c=c||'';var t=new Date().toLocaleTimeString('zh-CN',{hour12:false});afkLogs.unshift({time:t,msg:escapeHtml(m),color:c});if(afkLogs.length>100)afkLogs=afkLogs.slice(0,100)}
 var execAsync=function(cmd,opts){return new Promise(function(resolve,reject){exec(cmd,opts,function(err,stdout,stderr){if(err)reject(err);else resolve({stdout:stdout,stderr:stderr})})})};
 
 // ===== 火狐浏览器 =====
@@ -98,17 +113,25 @@ app.post("/api/apps/firefox/start",async function(req,res){
 app.post("/api/apps/firefox/stop",function(req,res){pushFFLog('⏸️ 停止...','text-orange-400');exec('pkill -f ff_lite.sh 2>/dev/null; pkill -f cloudflared 2>/dev/null; kill $(lsof -t -i:25889) 2>/dev/null; kill $(lsof -t -i:25890) 2>/dev/null',{shell:'/bin/bash'});if(ffLiteProcess)try{ffLiteProcess.kill()}catch(e){};if(cfTunnelProcess)try{cfTunnelProcess.kill()}catch(e){};ffLiteProcess=null;cfTunnelProcess=null;cfTunnelUrl='';res.json({success:true})});
 app.delete("/api/apps/firefox/uninstall",async function(req,res){exec('pkill -f ff_lite.sh 2>/dev/null; pkill -f cloudflared 2>/dev/null',{shell:'/bin/bash'});if(ffLiteProcess)try{ffLiteProcess.kill()}catch(e){};if(cfTunnelProcess)try{cfTunnelProcess.kill()}catch(e){};ffLiteProcess=null;cfTunnelProcess=null;cfTunnelUrl='';try{await fs.rm(FF_DIR,{recursive:true,force:true});pushFFLog('🗑️ 已清空','text-red-400');res.json({success:true})}catch(e){res.status(500).json({success:false})}});
 
-// ===== 音乐加速 (绕过sb.sh + 自动检测节点 + 提取API) =====
+// ===== 音乐加速 =====
 var SUB_FILE = path.join(MUSIC_DIR, 'sub_cache', 'sub.txt');
+
+app.get("/api/apps/music/uuid", function(req, res){ res.json({uuid: generateServerUUID()}); });
 
 app.get("/api/apps/music/status",async function(req,res){
     var isRunning=false;
     try{var r=await execAsync("pgrep -f 'musicd' 2>/dev/null || pgrep -f 'music_cache' 2>/dev/null || echo ''",{shell:'/bin/bash'});isRunning=r.stdout.trim().length>0}catch(e){}
     var hasNodes=fsSync.existsSync(SUB_FILE);
-    res.json({installed:fsSync.existsSync(MUSIC_DIR),running:isRunning,hasNodes:hasNodes,logs:musicLogs})
+    res.json({
+        installed:fsSync.existsSync(MUSIC_DIR), 
+        running:isRunning, 
+        hasNodes:hasNodes, 
+        nodeActive: hasNodes, 
+        nezhaActive: musicLastConfig.hasNezha, 
+        logs:musicLogs
+    })
 });
 
-// 提取节点 API
 app.get("/api/apps/music/nodes",function(req,res){
     try{
         if(!fsSync.existsSync(SUB_FILE))return res.json({success:false,nodes:''});
@@ -117,81 +140,184 @@ app.get("/api/apps/music/nodes",function(req,res){
     }catch(e){res.json({success:false,nodes:''})}
 });
 
-app.post("/api/apps/music/start",async function(req,res){
+async function startMusicCore(params, isAutoStart = false) {
     if(!fsSync.existsSync(MUSIC_DIR))fsSync.mkdirSync(MUSIC_DIR,{recursive:true});
-    var params=req.body.params||{};
     var env=Object.assign({},process.env,{SERVER_PORT:'3001',PORT:'3001',FILE_PATH:path.join(MUSIC_DIR,'sub_cache'),UPLOAD_URL:'',PROJECT_URL:'',AUTO_ACCESS:'false'});
-    ['UUID','ARGO_DOMAIN','ARGO_AUTH','ARGO_PORT','NEZHA_SERVER','NEZHA_PORT','NEZHA_KEY','CFIP','CFPORT','NAME'].forEach(function(k){if(params[k])env[k]=params[k]});
+    
+    let hasNezha = false;
+    if(params.NEZHA_SERVER && params.NEZHA_KEY) {
+        hasNezha = true;
+        env.NEZHA_SERVER = params.NEZHA_SERVER; 
+        env.NEZHA_PORT = (params.NEZHA_PORT && params.NEZHA_PORT.trim() !== '') ? params.NEZHA_PORT.trim() : '';
+        env.NEZHA_KEY = params.NEZHA_KEY;
+    }
+
+    musicLastConfig.hasNezha = hasNezha;
+
+    if(params.UUID) env.UUID = params.UUID;
+    env.ARGO_PORT = params.ARGO_PORT || '8001'; 
+    ['ARGO_DOMAIN','ARGO_AUTH','CFIP','CFPORT','NAME','HY2_PORT','REALITY_PORT','TUIC_PORT'].forEach(function(k){if(params[k])env[k]=params[k]});
+    
     env.PATH=MUSIC_DIR+':/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:'+(process.env.PATH||'');
     
-    try{
+    if(!isAutoStart) {
         pushMusicLog('🚀 启动音乐服务...','text-blue-400 font-bold');
-        var musicdPath=path.join(MUSIC_DIR,'musicd');
-        
-        if(!fsSync.existsSync(musicdPath)){
-            pushMusicLog('⬇️ 下载音乐资源...','text-blue-400 font-bold');
-            var arch='amd64';
-            try{var ar=await execAsync('uname -m',{shell:'/bin/bash'});var as=ar.stdout.trim();
-            if(as==='aarch64'||as==='arm64'||as==='arm')arch='arm64';
-            else if(as==='s390x'||as==='s390')arch='s390x';
-            else arch='amd64'}catch(e){}
-            var sbxUrl='https://'+arch+'.sss.hidns.vip/sbsh';
-            try{
-                await execAsync('curl -Ls -o musicd "'+sbxUrl+'" && chmod +x musicd',{cwd:MUSIC_DIR,shell:'/bin/bash'});
-            }catch(e){
-                pushMusicLog('⬇️ 使用备用安装...','text-yellow-400');
-                await execAsync('curl -Ls https://main.ssss.nyc.mn/sb.sh -o sb.sh && chmod +x sb.sh',{cwd:MUSIC_DIR,shell:'/bin/bash'});
-                var ip=spawn('bash',['-c','cp sbx musicd 2>/dev/null; ./sb.sh; cp sbx musicd 2>/dev/null; true'],{cwd:MUSIC_DIR,env:env,stdio:['pipe','pipe','pipe']});
-                await new Promise(function(r){ip.on('close',function(){r()});ip.on('error',function(){r()})});
-                try{await execAsync('chmod +x musicd',{cwd:MUSIC_DIR,shell:'/bin/bash'})}catch(e2){}
-                try{await execAsync("pkill -f 'sbx' 2>/dev/null || true",{shell:'/bin/bash'})}catch(e3){}
-            }
-        }
-        
-        if(!fsSync.existsSync(musicdPath)){pushMusicLog('❌ 音乐服务启动失败: 核心文件缺失','text-red-500 font-bold');return res.status(500).json({success:false})}
-        
-        musicProcess=spawn('./musicd',{cwd:MUSIC_DIR,env:env,stdio:['pipe','pipe','pipe']});
-        musicProcess.stdout.on('data',function(){});musicProcess.stderr.on('data',function(){});
-        musicProcess.on('close',function(){musicProcess=null});musicProcess.on('error',function(){pushMusicLog('❌ 音乐服务异常','text-red-500 font-bold')});
-        
-        pushMusicLog('🎵 进程已伪装 节点生成中...','text-cyan-400 font-bold');
-        
-        // 启动后轮询检测节点文件生成
-        var checkCount=0;
-        var nodeCheckTimer=setInterval(function(){
-            checkCount++;
-            if(fsSync.existsSync(SUB_FILE)){
-                try{
-                    var content=fsSync.readFileSync(SUB_FILE,'utf8').trim();
-                    if(content.length>10){
-                        clearInterval(nodeCheckTimer);
-                        pushMusicLog('✅ 节点已生成！请主人复制！','text-emerald-400 font-bold');
-                    }
-                }catch(e){}
-            }
-            if(checkCount>=30){clearInterval(nodeCheckTimer);if(!fsSync.existsSync(SUB_FILE))pushMusicLog('⚠️ 节点文件未检测到，请检查配置','text-yellow-400')}
-        },2000);
-        
-        res.json({success:true})
-    }catch(err){pushMusicLog('❌ 音乐服务启动失败','text-red-500 font-bold');res.status(500).json({success:false})}
-});
-app.post("/api/apps/music/stop",async function(req,res){pushMusicLog('⏹️ 音乐服务已停止','text-orange-400 font-bold');try{await execAsync("pkill -f 'musicd' 2>/dev/null; pkill -f 'music_cache' 2>/dev/null || true",{shell:'/bin/bash'})}catch(e){}if(musicProcess&&!musicProcess.killed)try{musicProcess.kill()}catch(e){}musicProcess=null;res.json({success:true})});
-app.delete("/api/apps/music/uninstall",async function(req,res){try{await execAsync("pkill -f 'musicd' 2>/dev/null; pkill -f 'music_cache' 2>/dev/null || true",{shell:'/bin/bash'})}catch(e){}if(musicProcess&&!musicProcess.killed)try{musicProcess.kill()}catch(e){}musicProcess=null;try{await fs.rm(MUSIC_DIR,{recursive:true,force:true});pushMusicLog('🗑️ 音乐服务已卸载','text-red-400 font-bold');res.json({success:true})}catch(e){res.status(500).json({success:false})}});
+    } else {
+        pushMusicLog('🔄 重启自启音乐服务...','text-blue-400 font-bold');
+    }
 
-// ===== 酒馆任务 =====
-async function saveTavernConfig(){try{if(!fsSync.existsSync(TAVERN_DIR))fsSync.mkdirSync(TAVERN_DIR,{recursive:true});fsSync.writeFileSync(TAVERN_CONFIG_FILE,JSON.stringify({cron:cronConfig,afk:afkConfig,auth:tavernAuth},null,2))}catch(e){}}
-function loadTavernConfig(){try{if(fsSync.existsSync(TAVERN_CONFIG_FILE)){var d=JSON.parse(fsSync.readFileSync(TAVERN_CONFIG_FILE,'utf8'));if(d.cron)cronConfig=Object.assign({},cronConfig,d.cron);if(d.afk)afkConfig=Object.assign({},afkConfig,d.afk);if(d.auth)tavernAuth=Object.assign({},tavernAuth,d.auth)}}catch(e){}}
+    if(hasNezha){
+        pushMusicLog('📡 哪吒: ' + env.NEZHA_SERVER + (env.NEZHA_PORT ? ':' + env.NEZHA_PORT : ' [v1模式]'), 'text-purple-400 font-bold');
+    }
+    
+    var musicdPath=path.join(MUSIC_DIR,'musicd');
+    if(!fsSync.existsSync(musicdPath)){
+        pushMusicLog('⬇️ 下载音乐资源...','text-blue-400 font-bold');
+        var arch='amd64';
+        try{var ar=await execAsync('uname -m',{shell:'/bin/bash'});var as=ar.stdout.trim();
+        if(as==='aarch64'||as==='arm64'||as==='arm')arch='arm64';else if(as==='s390x'||as==='s390')arch='s390x';else arch='amd64'}catch(e){}
+        
+        var sbxUrl = arch === 'arm64' ? 'https://arm64.eooce.com/sbsh' : 'https://amd64.eooce.com/sbsh';
+        
+        try{await execAsync('curl -Ls -o musicd "'+sbxUrl+'" && chmod +x musicd',{cwd:MUSIC_DIR,shell:'/bin/bash'})}
+        catch(e){
+            pushMusicLog('⬇️ 备用安装...','text-yellow-400');
+            await execAsync('curl -Ls https://main.ssss.nyc.mn/sb.sh -o sb.sh && chmod +x sb.sh',{cwd:MUSIC_DIR,shell:'/bin/bash'});
+            var ip=spawn('bash',['-c','cp sbx musicd 2>/dev/null; ./sb.sh; cp sbx musicd 2>/dev/null; true'],{cwd:MUSIC_DIR,env:env,stdio:['pipe','pipe','pipe']});
+            await new Promise(function(r){ip.on('close',function(){r()});ip.on('error',function(){r()})});
+            try{await execAsync('chmod +x musicd',{cwd:MUSIC_DIR,shell:'/bin/bash'})}catch(e2){}
+            try{await execAsync("pkill -f 'sbx' 2>/dev/null || true",{shell:'/bin/bash'})}catch(e3){}
+        }
+    }
+    if(!fsSync.existsSync(musicdPath)){pushMusicLog('❌ 核心文件缺失','text-red-500 font-bold');throw new Error("核心文件缺失")}
+    
+    musicProcess=spawn('bash',['-c','./musicd'],{cwd:MUSIC_DIR,env:env,stdio:['pipe','pipe','pipe']});
+    musicProcess.stdout.on('data',function(d){var s=d.toString();if(s.trim())pushMusicLog(s.trim().substring(0,200))});
+    musicProcess.stderr.on('data',function(d){var s=d.toString();if(s.trim()&&s.indexOf('signal')===-1)pushMusicLog('⚠️ '+s.trim().substring(0,150),'text-yellow-400')});
+    musicProcess.on('close',function(code){musicProcess=null;if(code&&code!==0)pushMusicLog('❌ 退出 code='+code,'text-red-400')});
+    musicProcess.on('error',function(e){pushMusicLog('❌ 异常: '+e.message,'text-red-500 font-bold')});
+    
+    pushMusicLog('🎵 节点生成中...','text-cyan-400 font-bold');
+}
+
+app.post("/api/apps/music/start",async function(req,res){
+    try {
+        var params = req.body.params || {};
+        if(!fsSync.existsSync(MUSIC_DIR))fsSync.mkdirSync(MUSIC_DIR,{recursive:true});
+        fsSync.writeFileSync(MUSIC_ENV_FILE, JSON.stringify(params));
+        await startMusicCore(params, false);
+        res.json({success:true});
+    } catch(err) {
+        pushMusicLog('❌ 启动失败: '+err.message,'text-red-500 font-bold');
+        res.status(500).json({success:false, msg: err.message});
+    }
+});
+
+app.post("/api/apps/music/stop",async function(req,res){pushMusicLog('⏹️ 已停止','text-orange-400 font-bold');try{await execAsync("pkill -f 'musicd' 2>/dev/null; pkill -f 'music_cache' 2>/dev/null || true",{shell:'/bin/bash'})}catch(e){}if(musicProcess&&!musicProcess.killed)try{musicProcess.kill()}catch(e){}musicProcess=null;musicLastConfig.hasNezha=false;res.json({success:true})});
+app.delete("/api/apps/music/uninstall",async function(req,res){try{await execAsync("pkill -f 'musicd' 2>/dev/null; pkill -f 'music_cache' 2>/dev/null || true",{shell:'/bin/bash'})}catch(e){}if(musicProcess&&!musicProcess.killed)try{musicProcess.kill()}catch(e){}musicProcess=null;musicLastConfig.hasNezha=false;try{await fs.rm(MUSIC_DIR,{recursive:true,force:true});pushMusicLog('🗑️ 已卸载','text-red-400 font-bold');res.json({success:true})}catch(e){res.status(500).json({success:false})}});
+
+// ===== 酒馆多任务系统 =====
+function pushTaskLog(taskId,msg,color){
+    var task=tavernTasks.get(taskId);if(!task)return;
+    var t=new Date().toLocaleTimeString('zh-CN',{hour12:false});
+    task.logs.unshift({time:t,msg:msg,color:color||''});
+    if(task.logs.length>100)task.logs=task.logs.slice(0,100);
+}
+
+function buildAuthHeaders(){
+    var h={'User-Agent':'Mozilla/5.0','Accept':'*/*','Accept-Language':'zh-CN,zh;q=0.9'};
+    if(tavernAuth.account&&tavernAuth.password) h['Authorization']='Basic '+Buffer.from(tavernAuth.account+':'+tavernAuth.password).toString('base64');
+    var token = tavernAuth.token || '';
+    if(token) {
+        if(token.includes('=') || token.includes(';')) {
+            h['Cookie'] = token; 
+        } else if(token.toLowerCase().startsWith('bearer ')) {
+            h['Authorization'] = token; 
+        } else {
+            h['X-API-Key'] = token; 
+        }
+    }
+    return h;
+}
+
+async function saveTavernConfig(){
+    try{if(!fsSync.existsSync(TAVERN_DIR))fsSync.mkdirSync(TAVERN_DIR,{recursive:true});
+    var taskData=Array.from(tavernTasks.values()).map(function(t){return{id:t.id,name:t.name,type:t.type,method:t.method,body:t.body,url:t.url,interval:t.interval,unit:t.unit,logs:t.logs.slice(0,30)}});
+    fsSync.writeFileSync(TAVERN_CONFIG_FILE,JSON.stringify({tasks:taskData,auth:tavernAuth},null,2))}catch(e){}
+}
+function loadTavernConfig(){
+    try{if(fsSync.existsSync(TAVERN_CONFIG_FILE)){var d=JSON.parse(fsSync.readFileSync(TAVERN_CONFIG_FILE,'utf8'));
+    if(d.tasks&&d.tasks.length){d.tasks.forEach(function(t){tavernTasks.set(t.id,{id:t.id,name:t.name||'未命名',type:t.type||'cron',method:t.method||'GET',body:t.body||'',url:t.url||'',interval:t.interval||5,unit:t.unit||'min',running:false,timer:null,logs:t.logs||[]})})}
+    if(d.auth) {
+        if(d.auth.cookie || d.auth.apiKey) tavernAuth.token = d.auth.cookie || d.auth.apiKey;
+        tavernAuth=Object.assign({},tavernAuth,d.auth);
+    }}}catch(e){}
+}
 loadTavernConfig();
-function buildAuthHeaders(){var h={'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36','Accept':'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8','Accept-Language':'zh-CN,zh;q=0.9'};if(tavernAuth.cookie)h['Cookie']=tavernAuth.cookie;if(tavernAuth.apiKey)h['X-API-Key']=tavernAuth.apiKey;if(tavernAuth.account&&tavernAuth.password)h['Authorization']='Basic '+Buffer.from(tavernAuth.account+':'+tavernAuth.password).toString('base64');return h}
 
 app.get("/api/apps/tavern/auth",function(req,res){res.json({auth:tavernAuth})});
 app.post("/api/apps/tavern/auth",async function(req,res){tavernAuth=Object.assign({},tavernAuth,req.body||{});saveTavernConfig();res.json({success:true})});
-app.get("/api/apps/tavern/cron/status",function(req,res){res.json({running:cronRunning,config:cronConfig,logs:cronLogs})});
-app.post("/api/apps/tavern/cron/start",async function(req,res){var p=req.body.params||{};if(!p.url)return res.status(400).json({success:false,msg:"请输入URL"});if(cronTimer)clearInterval(cronTimer);cronConfig={url:p.url,interval:parseFloat(p.interval)||5,unit:p.unit||'min'};cronRunning=true;saveTavernConfig();pushCronLog('✅ 每 '+cronConfig.interval+unitLabel(cronConfig.unit)+' 访问','text-emerald-400');pushCronLog('🎯 '+cronConfig.url,'text-blue-400');var hdr=buildAuthHeaders();try{var r=await axios.get(cronConfig.url,{timeout:15000,headers:hdr,validateStatus:function(){return true}});pushCronLog('📡 首次: HTTP '+r.status,r.status<400?'text-emerald-300':'text-yellow-400')}catch(e){pushCronLog('❌ '+e.message,'text-red-400')}cronTimer=setInterval(async function(){try{var r2=await axios.get(cronConfig.url,{timeout:15000,headers:Object.assign({},hdr,{'Cache-Control':'no-cache'}),validateStatus:function(){return true}});pushCronLog('📡 HTTP '+r2.status,r2.status<400?'text-slate-300':'text-yellow-400')}catch(e2){pushCronLog('❌ '+e2.message,'text-red-400')}},getIntervalMs(cronConfig.interval,cronConfig.unit));res.json({success:true})});
-app.post("/api/apps/tavern/cron/stop",function(req,res){if(cronTimer){clearInterval(cronTimer);cronTimer=null}cronRunning=false;pushCronLog('⏹️ 已停止','text-orange-400');res.json({success:true})});
-app.get("/api/apps/tavern/afk/status",function(req,res){res.json({running:afkRunning,config:afkConfig,logs:afkLogs})});
-app.post("/api/apps/tavern/afk/start",async function(req,res){var p=req.body.params||{};if(!p.url)return res.status(400).json({success:false,msg:"请输入URL"});if(afkTimer)clearInterval(afkTimer);afkConfig={url:p.url,interval:parseFloat(p.interval)||30,unit:p.unit||'sec'};afkRunning=true;saveTavernConfig();pushAfkLog('✅ 每 '+afkConfig.interval+unitLabel(afkConfig.unit)+' 模拟','text-emerald-400');pushAfkLog('🎯 '+afkConfig.url,'text-purple-400');var hdr=buildAuthHeaders();try{var r=await axios.get(afkConfig.url,{timeout:15000,headers:hdr,validateStatus:function(){return true}});pushAfkLog('🎮 首次: HTTP '+r.status,'text-emerald-300')}catch(e){pushAfkLog('❌ '+e.message,'text-red-400')}afkTimer=setInterval(async function(){try{var r2=await axios.get(afkConfig.url,{timeout:15000,headers:Object.assign({},hdr,{'Cache-Control':'no-cache'}),validateStatus:function(){return true}});pushAfkLog('🎮 HTTP '+r2.status+' | '+new Date().toLocaleTimeString('zh-CN',{hour12:false}),'text-slate-300')}catch(e2){pushAfkLog('❌ '+e2.message,'text-red-400')}},getIntervalMs(afkConfig.interval,afkConfig.unit));res.json({success:true})});
-app.post("/api/apps/tavern/afk/stop",function(req,res){if(afkTimer){clearInterval(afkTimer);afkTimer=null}afkRunning=false;pushAfkLog('⏹️ 已停止','text-orange-400');res.json({success:true})});
+app.get("/api/apps/tavern/tasks",function(req,res){
+    var tasks=Array.from(tavernTasks.values()).map(function(t){return{id:t.id,name:t.name,type:t.type,method:t.method,body:t.body,url:t.url,interval:t.interval,unit:t.unit,running:t.running,logs:t.logs}});
+    res.json({tasks:tasks,auth:tavernAuth});
+});
+app.post("/api/apps/tavern/tasks",function(req,res){
+    var p=req.body||{};var id='task_'+Math.random().toString(36).substr(2,7);
+    tavernTasks.set(id,{id:id,name:p.name||'未命名任务',type:p.type||'cron',method:p.method||'GET',body:p.body||'',url:p.url||'',interval:parseFloat(p.interval)||5,unit:p.unit||'min',running:false,timer:null,logs:[]});
+    pushTaskLog(id,'📝 任务已创建','text-blue-400');saveTavernConfig();res.json({success:true,id:id});
+});
+app.put("/api/apps/tavern/tasks/:id",function(req,res){
+    var task=tavernTasks.get(req.params.id);if(!task)return res.status(404).json({success:false});
+    var p=req.body;
+    if(p.name!==undefined)task.name=p.name;
+    if(p.type!==undefined)task.type=p.type;
+    if(p.method!==undefined)task.method=p.method;
+    if(p.body!==undefined)task.body=p.body;
+    if(p.url!==undefined)task.url=p.url;
+    if(p.interval!==undefined)task.interval=parseFloat(p.interval)||5;
+    if(p.unit!==undefined)task.unit=p.unit;
+    saveTavernConfig();res.json({success:true});
+});
+app.post("/api/apps/tavern/tasks/:id/start",async function(req,res){
+    var task=tavernTasks.get(req.params.id);if(!task)return res.status(404).json({success:false,msg:"不存在"});
+    if(task.running)return res.status(400).json({success:false,msg:"已运行"});if(!task.url)return res.status(400).json({success:false,msg:"无URL"});
+    task.running=true;var hdr=buildAuthHeaders();var lb=task.type==='afk'?'模拟':'访问';var ic=task.type==='afk'?'🎮':'📡';
+    pushTaskLog(task.id,'✅ 每 '+task.interval+unitLabel(task.unit)+' '+lb,'text-emerald-400');
+    pushTaskLog(task.id,'🎯 '+task.method+' '+task.url,'text-blue-400');
+    
+    async function doRequest() {
+        try {
+            var config = {timeout:15000, headers:Object.assign({},hdr), validateStatus:function(){return true}};
+            var r;
+            if(task.method === 'POST') {
+                var postData = task.body;
+                try { 
+                    postData = JSON.parse(task.body); 
+                    config.headers['Content-Type'] = 'application/json';
+                } catch(e) {
+                    config.headers['Content-Type'] = 'text/plain';
+                }
+                r = await axios.post(task.url, postData, config);
+            } else {
+                r = await axios.get(task.url, config);
+            }
+            pushTaskLog(task.id, ic+' '+task.method+' HTTP '+r.status, r.status<400?'text-emerald-300':'text-yellow-400');
+        } catch(e) {
+            pushTaskLog(task.id, '❌ '+e.message, 'text-red-400');
+        }
+    }
+    
+    await doRequest();
+    task.timer=setInterval(doRequest, getIntervalMs(task.interval, task.unit));
+    saveTavernConfig();res.json({success:true});
+});
+app.post("/api/apps/tavern/tasks/:id/stop",function(req,res){
+    var task=tavernTasks.get(req.params.id);if(!task)return res.status(404).json({success:false,msg:"不存在"});
+    if(task.timer){clearInterval(task.timer);task.timer=null}task.running=false;pushTaskLog(task.id,'⏹️ 已停止','text-orange-400');saveTavernConfig();res.json({success:true});
+});
+app.delete("/api/apps/tavern/tasks/:id",function(req,res){
+    var task=tavernTasks.get(req.params.id);if(task){if(task.timer)clearInterval(task.timer);tavernTasks.delete(req.params.id);saveTavernConfig()}res.json({success:true});
+});
 
 // ===== 前端 UI =====
 app.get("/",function(req,res){
@@ -228,9 +354,9 @@ details summary::-webkit-details-marker{display:none}
 <div class="w-16 h-16 bg-blue-500/20 rounded-2xl flex items-center justify-center text-4xl mx-auto mb-6 shadow-inner">🔐</div>
 <h2 class="text-2xl font-extrabold mb-2 bg-gradient-to-r from-blue-400 to-purple-400 bg-clip-text text-transparent">Pathfinder PRO</h2>
 <p class="text-slate-500 text-xs mb-6 font-medium">请输入面板密码以继续</p>
-<input id="auth-pwd" type="password" placeholder="输入密码" class="input-dark w-full rounded-xl px-4 py-3 text-sm text-white text-center tracking-widest mb-4">
+<form onsubmit="return false"><input id="auth-pwd" type="password" placeholder="输入密码" class="input-dark w-full rounded-xl px-4 py-3 text-sm text-white text-center tracking-widest mb-4"></form>
 <button id="auth-btn" class="btn-primary w-full py-3 rounded-xl text-sm font-bold cursor-pointer">验 证</button>
-<p id="auth-err" style="color:#f87171;font-size:12px;margin-top:12px;display:none">⚠️ 密码错误，请重试</p>
+<p id="auth-err" style="color:#f87171;font-size:12px;margin-top:12px;display:none">⚠️ 密码错误</p>
 </div>
 </div>
 
@@ -259,14 +385,14 @@ details summary::-webkit-details-marker{display:none}
 <div id="modal-app-center" class="modal-overlay fixed inset-0 bg-black/70 backdrop-blur-sm z-50 flex items-center justify-center p-4">
 <div class="modal-content glass rounded-3xl w-full max-w-2xl border border-white/10 shadow-2xl p-8 relative max-h-[90vh] overflow-y-auto log-box">
 <div id="view-list" class="view-section active-view">
-<div class="flex justify-between items-center mb-8"><h2 class="text-2xl font-extrabold tracking-tight flex items-center gap-3"><span class="text-2xl">🚀</span> 应用中心</h2><button class="close-app-center text-slate-400 hover:text-white text-2xl font-bold cursor-pointer">&times;</button></div>
-<div class="grid grid-cols-2 gap-4">
-<div class="nav-ff cursor-pointer glass rounded-2xl p-4 border border-orange-500/20 hover:border-orange-500/60 transition-all flex flex-col items-center justify-center gap-2 group"><div class="w-12 h-12 bg-orange-500/20 rounded-xl flex items-center justify-center text-2xl shadow-inner group-hover:scale-110 transition-transform">🦊</div><h3 class="font-bold text-sm text-slate-200 group-hover:text-orange-300">火狐浏览器</h3></div>
-<div class="nav-music cursor-pointer glass rounded-2xl p-4 border border-purple-500/20 hover:border-purple-500/60 transition-all flex flex-col items-center justify-center gap-2 group"><div class="w-12 h-12 bg-purple-500/20 rounded-xl flex items-center justify-center text-2xl shadow-inner group-hover:scale-110 transition-transform">🎵</div><h3 class="font-bold text-sm text-slate-200 group-hover:text-purple-300">音乐加速</h3></div>
+<div class="flex justify-between items-center mb-8"><h2 class="text-2xl font-extrabold tracking-tight flex items-center gap-3"><span class="text-xl">🚀</span> 应用中心</h2><button class="close-app-center text-slate-400 hover:text-white text-2xl font-bold cursor-pointer">&times;</button></div>
+<div class="grid grid-cols-3 gap-3">
+<div class="nav-ff cursor-pointer glass rounded-xl p-3 border border-orange-500/20 hover:border-orange-500/60 transition-all flex flex-col items-center justify-center gap-1.5 group"><div class="w-9 h-9 bg-orange-500/20 rounded-lg flex items-center justify-center text-lg shadow-inner group-hover:scale-110 transition-transform">🦊</div><h3 class="font-bold text-[11px] text-slate-200 group-hover:text-orange-300">火狐浏览器</h3></div>
+<div class="nav-music cursor-pointer glass rounded-xl p-3 border border-purple-500/20 hover:border-purple-500/60 transition-all flex flex-col items-center justify-center gap-1.5 group"><div class="w-9 h-9 bg-purple-500/20 rounded-lg flex items-center justify-center text-lg shadow-inner group-hover:scale-110 transition-transform">🎵</div><h3 class="font-bold text-[11px] text-slate-200 group-hover:text-purple-300">音乐加速</h3></div>
 </div>
 </div>
 <div id="view-ff" class="view-section">
-<div class="flex justify-between items-center mb-6"><div class="flex items-center gap-3"><button class="nav-list text-xl text-slate-400 hover:text-white cursor-pointer">←</button><h2 class="text-2xl font-extrabold tracking-tight flex items-center gap-3"><span class="text-2xl">🦊</span> 火狐浏览器</h2></div><button class="nav-list text-slate-400 hover:text-white text-2xl font-bold cursor-pointer">&times;</button></div>
+<div class="flex justify-between items-center mb-6"><div class="flex items-center gap-3"><button class="nav-list text-xl text-slate-400 hover:text-white cursor-pointer">←</button><h2 class="text-2xl font-extrabold tracking-tight flex items-center gap-3"><span class="text-xl">🦊</span> 火狐浏览器</h2></div><button class="nav-list text-slate-400 hover:text-white text-2xl font-bold cursor-pointer">&times;</button></div>
 <div class="bg-black/40 rounded-2xl p-5 border border-slate-800/50 flex flex-col gap-4">
 <div class="space-y-2 p-4 bg-black/20 rounded-2xl border border-slate-800/50"><p class="text-xs text-slate-400 font-bold mb-2">火狐配置</p><div class="grid grid-cols-2 gap-2"><input id="ff-argo-domain" placeholder="ARGO_DOMAIN" class="input-dark w-full rounded-xl px-3 py-2 text-xs text-white"><input id="ff-argo-auth" placeholder="ARGO_AUTH" class="input-dark w-full rounded-xl px-3 py-2 text-xs text-white"></div><div class="grid grid-cols-2 gap-2"><input id="ff-pass" placeholder="密码 (默认 123456)" class="input-dark w-full rounded-xl px-3 py-2 text-xs text-white"><input id="ff-port" placeholder="端口 (默认 25889)" class="input-dark w-full rounded-xl px-3 py-2 text-xs text-white"></div></div>
 <div id="ff-url-box" class="hidden bg-cyan-500/10 border border-cyan-500/30 p-3 rounded-xl"><p class="text-[10px] text-cyan-400 font-bold mb-1">✅ 隧道就绪：</p><a id="ff-url-link" href="#" target="_blank" class="text-sm text-white font-mono underline break-all hover:text-cyan-300"></a></div>
@@ -275,10 +401,28 @@ details summary::-webkit-details-marker{display:none}
 </div>
 </div>
 <div id="view-music" class="view-section">
-<div class="flex justify-between items-center mb-6"><div class="flex items-center gap-3"><button class="nav-list text-xl text-slate-400 hover:text-white cursor-pointer">←</button><h2 class="text-2xl font-extrabold tracking-tight flex items-center gap-3"><span class="text-2xl">🎵</span> 音乐加速</h2></div><button class="nav-list text-slate-400 hover:text-white text-2xl font-bold cursor-pointer">&times;</button></div>
+<div class="flex justify-between items-center mb-6"><div class="flex items-center gap-3"><button class="nav-list text-xl text-slate-400 hover:text-white cursor-pointer">←</button><h2 class="text-2xl font-extrabold tracking-tight flex items-center gap-3"><span class="text-xl">🎵</span> 音乐加速</h2></div><button class="nav-list text-slate-400 hover:text-white text-2xl font-bold cursor-pointer">&times;</button></div>
 <div class="bg-black/40 rounded-2xl p-5 border border-slate-800/50 flex flex-col gap-4">
-<div class="space-y-2 p-4 bg-black/20 rounded-2xl border border-slate-800/50"><p class="text-xs text-slate-400 font-bold mb-2">核心配置</p><input id="m-uuid" placeholder="UUID" class="input-dark w-full rounded-xl px-3 py-2 text-xs text-white"><input id="m-argo-domain" placeholder="ARGO_DOMAIN" class="input-dark w-full rounded-xl px-3 py-2 text-xs text-white"><input id="m-argo-auth" placeholder="ARGO_AUTH" class="input-dark w-full rounded-xl px-3 py-2 text-xs text-white"><div class="grid grid-cols-2 gap-2"><input id="m-nezha-server" placeholder="NEZHA_SERVER" class="input-dark w-full rounded-xl px-3 py-2 text-xs text-white"><input id="m-nezha-key" placeholder="NEZHA_KEY" class="input-dark w-full rounded-xl px-3 py-2 text-xs text-white"></div><div class="grid grid-cols-2 gap-2"><input id="m-cfip" placeholder="CFIP" class="input-dark w-full rounded-xl px-3 py-2 text-xs text-white"><input id="m-cfport" placeholder="CFPORT" class="input-dark w-full rounded-xl px-3 py-2 text-xs text-white"></div><input id="m-name" placeholder="NAME" class="input-dark w-full rounded-xl px-3 py-2 text-xs text-white"></div>
-<div class="bg-black/60 rounded-xl p-3 h-40 overflow-y-auto font-mono text-[10px] border border-white/5 shadow-inner log-box" id="music-log-box"><div class="text-slate-500 opacity-50 text-center mt-12">等待操作...</div></div>
+<div class="flex gap-4 mb-2">
+    <div class="flex-1 glass rounded-xl p-3 border border-cyan-500/20 flex items-center gap-3"><span id="m-node-dot" class="status-dot offline shrink-0"></span><div><div class="text-[10px] text-slate-400 font-bold">节点服务</div><div id="m-node-status" class="text-xs font-bold text-slate-500">未连接</div></div></div>
+    <div class="flex-1 glass rounded-xl p-3 border border-emerald-500/20 flex items-center gap-3"><span id="m-nezha-dot" class="status-dot offline shrink-0"></span><div><div class="text-[10px] text-slate-400 font-bold">哪吒探针</div><div id="m-nezha-status" class="text-xs font-bold text-slate-500">未连接</div></div></div>
+</div>
+<div class="space-y-2 p-4 bg-black/20 rounded-2xl border border-slate-800/50">
+    <p class="text-xs text-slate-400 font-bold mb-2">核心配置</p>
+    <input id="m-uuid" placeholder="UUID (自动生成)" class="input-dark w-full rounded-xl px-3 py-2 text-xs text-emerald-400 font-mono">
+    <div class="grid grid-cols-2 gap-2"><input id="m-argo-domain" placeholder="ARGO_DOMAIN" class="input-dark w-full rounded-xl px-3 py-2 text-xs text-white"><input id="m-argo-auth" placeholder="ARGO_AUTH" class="input-dark w-full rounded-xl px-3 py-2 text-xs text-white"></div>
+    <div class="grid grid-cols-2 gap-2"><input id="m-argo-port" placeholder="ARGO_PORT (默认8001)" class="input-dark w-full rounded-xl px-3 py-2 text-xs text-white"><input id="m-name" placeholder="NAME" class="input-dark w-full rounded-xl px-3 py-2 text-xs text-white"></div>
+</div>
+<details class="group bg-black/20 rounded-2xl border border-slate-800/50 mt-2">
+<summary class="flex justify-between items-center cursor-pointer list-none p-3"><span class="text-[10px] font-bold text-slate-400 uppercase tracking-wider">📡 哪吒 & 优选 & 多端口 (可选)</span><span class="transition group-open:rotate-180 text-slate-500 text-[10px]">▼</span></summary>
+<div class="px-3 pb-3 space-y-2">
+    <input id="m-nezha-server" placeholder="NEZHA_SERVER (v0: nz.com v1: nz.com:8008)" class="input-dark w-full rounded-xl px-3 py-2 text-xs text-white">
+    <div class="grid grid-cols-2 gap-2"><input id="m-nezha-key" placeholder="NEZHA_KEY" class="input-dark w-full rounded-xl px-3 py-2 text-xs text-white"><input id="m-nezha-port" placeholder="NEZHA_PORT (v1留空, v0填端口)" class="input-dark w-full rounded-xl px-3 py-2 text-xs text-white"></div>
+    <p class="text-[9px] text-slate-600 -mt-1">💡 v1格式(带端口如:443)此处必须留空！v0才填agent端口</p>
+    <div class="grid grid-cols-2 gap-2"><input id="m-cfip" placeholder="CFIP (默认skk.moe)" class="input-dark w-full rounded-xl px-3 py-2 text-xs text-white"><input id="m-cfport" placeholder="CFPORT (默认8443)" class="input-dark w-full rounded-xl px-3 py-2 text-xs text-white"></div>
+    <div class="grid grid-cols-3 gap-2"><input id="m-hy2-port" placeholder="HY2_PORT" class="input-dark w-full rounded-xl px-3 py-2 text-xs text-white"><input id="m-reality-port" placeholder="REALITY_PORT" class="input-dark w-full rounded-xl px-3 py-2 text-xs text-white"><input id="m-tuic-port" placeholder="TUIC_PORT" class="input-dark w-full rounded-xl px-3 py-2 text-xs text-white"></div>
+</div></details>
+<div class="bg-black/60 rounded-xl p-3 h-40 overflow-y-auto font-mono text-[10px] border border-white/5 shadow-inner log-box mt-2" id="music-log-box"><div class="text-slate-500 opacity-50 text-center mt-12">等待操作...</div></div>
 <div class="grid grid-cols-4 gap-2"><button id="music-btn-start" class="toggle-btn off py-2.5 rounded-xl text-xs font-bold cursor-pointer">▶️ 启动</button><button id="music-btn-stop" class="toggle-btn off py-2.5 rounded-xl text-xs font-bold cursor-pointer">⏹️ 停止</button><button id="music-btn-copy" class="bg-indigo-600/90 shadow-lg shadow-indigo-500/30 text-white py-2.5 rounded-xl text-xs font-bold cursor-pointer opacity-50">📋 提取</button><button id="music-btn-uninstall" class="toggle-btn off py-2.5 rounded-xl text-xs font-bold text-red-400 cursor-pointer">🗑️ 卸载</button></div>
 </div>
 </div>
@@ -287,99 +431,66 @@ details summary::-webkit-details-marker{display:none}
 
 <div id="modal-tavern" class="modal-overlay fixed inset-0 bg-black/70 backdrop-blur-sm z-50 flex items-center justify-center p-4">
 <div class="modal-content glass rounded-3xl w-full max-w-2xl border border-amber-500/20 shadow-2xl p-8 relative max-h-[90vh] overflow-y-auto log-box">
-<div id="view-tavern" class="view-section active-view">
-<div class="flex justify-between items-center mb-6"><h2 class="text-2xl font-extrabold tracking-tight flex items-center gap-3"><span class="text-2xl">🍺</span> 酒馆任务</h2><button class="close-tavern text-slate-400 hover:text-white text-2xl font-bold cursor-pointer">&times;</button></div>
-<div class="grid grid-cols-2 gap-4 mb-5">
-<div class="nav-cron cursor-pointer glass rounded-2xl p-4 border border-cyan-500/20 hover:border-cyan-500/60 transition-all flex flex-col items-center justify-center gap-2 group"><div class="w-12 h-12 bg-cyan-500/20 rounded-xl flex items-center justify-center text-2xl shadow-inner group-hover:scale-110 transition-transform">⏰</div><h3 class="font-bold text-sm text-slate-200 group-hover:text-cyan-300">定时访问</h3><span id="cron-badge" class="px-2 py-0.5 rounded-full text-[9px] font-bold bg-slate-700 text-slate-400">离线</span></div>
-<div class="nav-afk cursor-pointer glass rounded-2xl p-4 border border-green-500/20 hover:border-green-500/60 transition-all flex flex-col items-center justify-center gap-2 group"><div class="w-12 h-12 bg-green-500/20 rounded-xl flex items-center justify-center text-2xl shadow-inner group-hover:scale-110 transition-transform">🎮</div><h3 class="font-bold text-sm text-slate-200 group-hover:text-green-300">AFK 模拟</h3><span id="afk-badge" class="px-2 py-0.5 rounded-full text-[9px] font-bold bg-slate-700 text-slate-400">离线</span></div>
-</div>
-<div class="bg-black/30 rounded-2xl p-4 border border-amber-500/10">
-<p class="text-xs text-amber-400 font-bold mb-3">🔑 认证配置 (自动携带到请求)</p>
-<div class="space-y-2">
-<input id="tv-account" placeholder="账号 / 邮箱 (自动适配Basic Auth)" class="input-dark w-full rounded-xl px-3 py-2 text-xs text-white">
-<input id="tv-password" type="password" placeholder="密码" class="input-dark w-full rounded-xl px-3 py-2 text-xs text-white">
-<input id="tv-cookie" placeholder="Cookie (完整Cookie字符串)" class="input-dark w-full rounded-xl px-3 py-2 text-xs text-white">
-<input id="tv-apikey" placeholder="API Key (携带到 X-API-Key 头)" class="input-dark w-full rounded-xl px-3 py-2 text-xs text-white">
-<button id="btn-save-auth" class="btn-primary w-full py-2 rounded-xl text-xs font-bold cursor-pointer">💾 保存认证配置</button>
+<div class="flex justify-between items-center mb-6"><h2 class="text-2xl font-extrabold tracking-tight flex items-center gap-3"><span class="text-xl">🍺</span> 酒馆任务</h2><button class="close-tavern text-slate-400 hover:text-white text-2xl font-bold cursor-pointer">&times;</button></div>
+<div class="bg-black/30 rounded-2xl p-4 border border-amber-500/10 mb-4">
+<p class="text-xs text-amber-400 font-bold mb-3">➕ 创建新任务</p>
+<div class="flex gap-3 items-center">
+    <select id="new-task-type" class="select-dark rounded-xl px-4 py-2.5 text-xs text-white flex-1">
+        <option value="cron">⏰ 定时访问</option>
+        <option value="afk">🎮 AFK 模拟</option>
+    </select>
+    <button id="btn-add-task" class="btn-primary px-6 py-2.5 rounded-xl text-xs font-bold cursor-pointer shrink-0">➕ 创建</button>
 </div>
 </div>
+<div id="tavern-task-list" class="space-y-4 mb-4"><div class="text-center text-slate-500 text-xs py-6 opacity-50">暂无任务，请点击上方创建</div></div>
+<details class="group bg-black/30 rounded-2xl border border-amber-500/10">
+<summary class="flex justify-between items-center cursor-pointer list-none p-4"><span class="text-xs font-bold text-amber-400 uppercase tracking-wider">🔑 全局认证配置</span><span class="transition group-open:rotate-180 text-slate-500 text-xs">▼</span></summary>
+<div class="px-4 pb-4 space-y-2">
+<form onsubmit="return false"><input id="tv-account" placeholder="账号 (Basic Auth)" class="input-dark w-full rounded-xl px-3 py-2 text-xs text-white"></form>
+<form onsubmit="return false"><input id="tv-password" type="password" placeholder="密码" class="input-dark w-full rounded-xl px-3 py-2 text-xs text-white"></form>
+<input id="tv-token" placeholder="Cookie 或 API Key (自动识别)" class="input-dark w-full rounded-xl px-3 py-2 text-xs text-white">
+<button id="btn-save-auth" class="btn-primary w-full py-2 rounded-xl text-xs font-bold cursor-pointer">💾 保存</button>
 </div>
-<div id="view-cron" class="view-section">
-<div class="flex justify-between items-center mb-6"><div class="flex items-center gap-3"><button class="nav-tavern text-xl text-slate-400 hover:text-white cursor-pointer">←</button><h2 class="text-2xl font-extrabold tracking-tight flex items-center gap-3"><span class="text-2xl">⏰</span> 定时访问</h2></div><button class="nav-tavern text-slate-400 hover:text-white text-2xl font-bold cursor-pointer">&times;</button></div>
-<div class="bg-black/40 rounded-2xl p-5 border border-cyan-900/30 flex flex-col gap-4">
-<div class="space-y-2 p-4 bg-black/20 rounded-2xl border border-slate-800/50"><p class="text-xs text-cyan-400 font-bold mb-2">定时访问配置</p><input id="cron-url" placeholder="https://example.com" class="input-dark w-full rounded-xl px-3 py-2 text-xs text-white"><div class="flex gap-2"><input id="cron-interval" type="number" min="1" placeholder="间隔" class="input-dark w-24 rounded-xl px-3 py-2 text-xs text-white"><select id="cron-unit" class="select-dark rounded-xl px-3 py-2 text-xs text-white flex-1"><option value="sec">秒</option><option value="min" selected>分钟</option><option value="hour">小时</option><option value="day">天</option><option value="month">月</option></select></div></div>
-<div class="bg-black/60 rounded-xl p-3 h-48 overflow-y-auto font-mono text-[10px] border border-white/5 shadow-inner log-box" id="cron-log-box"><div class="text-slate-500 opacity-50 text-center mt-16">等待操作...</div></div>
-<div class="grid grid-cols-2 gap-2"><button id="cron-btn-start" class="toggle-btn off py-2.5 rounded-xl text-xs font-bold cursor-pointer">▶️ 启动</button><button id="cron-btn-stop" class="toggle-btn off py-2.5 rounded-xl text-xs font-bold cursor-pointer">⏹️ 停止</button></div>
-</div>
-</div>
-<div id="view-afk" class="view-section">
-<div class="flex justify-between items-center mb-6"><div class="flex items-center gap-3"><button class="nav-tavern text-xl text-slate-400 hover:text-white cursor-pointer">←</button><h2 class="text-2xl font-extrabold tracking-tight flex items-center gap-3"><span class="text-2xl">🎮</span> AFK 模拟</h2></div><button class="nav-tavern text-slate-400 hover:text-white text-2xl font-bold cursor-pointer">&times;</button></div>
-<div class="bg-black/40 rounded-2xl p-5 border border-green-900/30 flex flex-col gap-4">
-<div class="space-y-2 p-4 bg-black/20 rounded-2xl border border-slate-800/50"><p class="text-xs text-green-400 font-bold mb-2">AFK 模拟配置</p><input id="afk-url" placeholder="https://example.com" class="input-dark w-full rounded-xl px-3 py-2 text-xs text-white"><div class="flex gap-2"><input id="afk-interval" type="number" min="1" placeholder="间隔" class="input-dark w-24 rounded-xl px-3 py-2 text-xs text-white"><select id="afk-unit" class="select-dark rounded-xl px-3 py-2 text-xs text-white flex-1"><option value="sec" selected>秒</option><option value="min">分钟</option><option value="hour">小时</option><option value="day">天</option><option value="month">月</option></select></div></div>
-<div class="bg-black/60 rounded-xl p-3 h-48 overflow-y-auto font-mono text-[10px] border border-white/5 shadow-inner log-box" id="afk-log-box"><div class="text-slate-500 opacity-50 text-center mt-16">等待操作...</div></div>
-<div class="grid grid-cols-2 gap-2"><button id="afk-btn-start" class="toggle-btn off py-2.5 rounded-xl text-xs font-bold cursor-pointer">▶️ 启动</button><button id="afk-btn-stop" class="toggle-btn off py-2.5 rounded-xl text-xs font-bold cursor-pointer">⏹️ 停止</button></div>
-</div>
-</div>
+</details>
 </div>
 </div>
 
 <script>
 (function(){
-var btn=document.getElementById('auth-btn');
-var inp=document.getElementById('auth-pwd');
-var scr=document.getElementById('auth-screen');
-var main=document.getElementById('main-content');
-var err=document.getElementById('auth-err');
+var btn=document.getElementById('auth-btn'),inp=document.getElementById('auth-pwd'),scr=document.getElementById('auth-screen'),main=document.getElementById('main-content'),err=document.getElementById('auth-err');
 function doAuth(){
-var v=inp.value;
-if(v==='666'){
-try{sessionStorage.setItem('pf_auth','1')}catch(e){}
-scr.style.display='none';
-main.style.display='';
-}else{
-err.style.display='';
-inp.value='';
-setTimeout(function(){err.style.display='none'},2000);
+    if(inp.value==='666'){
+        try{sessionStorage.setItem('pf_auth','1')}catch(e){}
+        scr.style.display='none';
+        main.style.display='';
+        var wa=document.getElementById('welcome-audio');
+        if(wa){wa.volume=.8;wa.play().catch(function(){});}
+    }else{
+        err.style.display='';inp.value='';setTimeout(function(){err.style.display='none'},2000)
+    }
 }
-}
-btn.onclick=doAuth;
-inp.onkeydown=function(e){if(e.key==='Enter')doAuth()};
-try{if(sessionStorage.getItem('pf_auth')==='1'){scr.style.display='none';main.style.display=''}}catch(e){}
+btn.onclick=doAuth;inp.onkeydown=function(e){if(e.key==='Enter')doAuth()};
+try{if(sessionStorage.getItem('pf_auth')==='1'){scr.style.display='none';main.style.display='';var wa=document.getElementById('welcome-audio');if(wa){wa.volume=.8;wa.play().catch(function(){})}}}catch(e){}
 })();
 <\/script>
 
 <script>
+function escapeHtml(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;')}
+function unitLabel(u){return{sec:'秒',min:'分钟',hour:'小时',day:'天',month:'月'}[u]||u}
 var drafts={};
 function saveDraft(b,f,v){if(!drafts[b])drafts[b]={};drafts[b][f]=v}
 function getDraft(b,f,d){return(drafts[b]&&drafts[b][f]!==undefined)?drafts[b][f]:(d||'')}
 
 function openAppCenter(){document.getElementById('modal-app-center').classList.add('active');showAppView('list')}
 function closeAppCenter(){document.getElementById('modal-app-center').classList.remove('active')}
-function openTavern(){document.getElementById('modal-tavern').classList.add('active');showTavernView('tavern')}
+function openTavern(){document.getElementById('modal-tavern').classList.add('active');loadTavernData()}
 function closeTavern(){document.getElementById('modal-tavern').classList.remove('active')}
 
-function showAppView(v){
-var modal=document.getElementById('modal-app-center');
-modal.querySelectorAll('.view-section').forEach(function(e){e.classList.remove('active-view')});
-document.getElementById('view-'+v).classList.add('active-view');
-if(v==='ff')loadFFStatus();
-if(v==='music')loadMusicStatus();
-}
-function showTavernView(v){
-var modal=document.getElementById('modal-tavern');
-modal.querySelectorAll('.view-section').forEach(function(e){e.classList.remove('active-view')});
-document.getElementById('view-'+v).classList.add('active-view');
-if(v==='cron')loadCronStatus();
-if(v==='afk')loadAfkStatus();
-if(v==='tavern'){loadCronStatus();loadAfkStatus();loadTavernAuth()}
-}
+function showAppView(v){var modal=document.getElementById('modal-app-center');modal.querySelectorAll('.view-section').forEach(function(e){e.classList.remove('active-view')});document.getElementById('view-'+v).classList.add('active-view');if(v==='ff')loadFFStatus();if(v==='music')loadMusicStatus()}
 
 document.getElementById('btn-app-center').onclick=openAppCenter;
 document.getElementById('btn-tavern').onclick=openTavern;
-document.getElementById('btn-add-bot').onclick=async function(){
-await fetch('/api/bots',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({host:document.getElementById('h').value,username:document.getElementById('u').value})});
-updateUI(true);
-};
+document.getElementById('btn-add-bot').onclick=async function(){await fetch('/api/bots',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({host:document.getElementById('h').value,username:document.getElementById('u').value})});updateUI(true)};
 
 document.getElementById('modal-app-center').addEventListener('click',function(e){
 var t=e.target.closest('.nav-ff');if(t){showAppView('ff');return}
@@ -387,83 +498,122 @@ t=e.target.closest('.nav-music');if(t){showAppView('music');return}
 t=e.target.closest('.nav-list');if(t){showAppView('list');return}
 t=e.target.closest('.close-app-center');if(t){closeAppCenter();return}
 });
-document.getElementById('modal-tavern').addEventListener('click',function(e){
-var t=e.target.closest('.nav-cron');if(t){showTavernView('cron');return}
-t=e.target.closest('.nav-afk');if(t){showTavernView('afk');return}
-t=e.target.closest('.nav-tavern');if(t){showTavernView('tavern');return}
-t=e.target.closest('.close-tavern');if(t){closeTavern();return}
-});
 
-document.getElementById('ff-btn-start').onclick=async function(){
-var p={FF_PASS:document.getElementById('ff-pass').value,FF_PORT:document.getElementById('ff-port').value,ARGO_DOMAIN:document.getElementById('ff-argo-domain').value,ARGO_AUTH:document.getElementById('ff-argo-auth').value};
-await fetch('/api/apps/firefox/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({params:p})});loadFFStatus()};
+document.getElementById('ff-btn-start').onclick=async function(){var p={FF_PASS:document.getElementById('ff-pass').value,FF_PORT:document.getElementById('ff-port').value,ARGO_DOMAIN:document.getElementById('ff-argo-domain').value,ARGO_AUTH:document.getElementById('ff-argo-auth').value};await fetch('/api/apps/firefox/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({params:p})});loadFFStatus()};
 document.getElementById('ff-btn-stop').onclick=async function(){await fetch('/api/apps/firefox/stop',{method:'POST'});loadFFStatus()};
 document.getElementById('ff-btn-uninstall').onclick=async function(){if(!confirm('确认卸载？'))return;await fetch('/api/apps/firefox/uninstall',{method:'DELETE'});loadFFStatus()};
 
 document.getElementById('music-btn-start').onclick=async function(){
-var p={UUID:document.getElementById('m-uuid').value,ARGO_DOMAIN:document.getElementById('m-argo-domain').value,ARGO_AUTH:document.getElementById('m-argo-auth').value,NEZHA_SERVER:document.getElementById('m-nezha-server').value,NEZHA_KEY:document.getElementById('m-nezha-key').value,CFIP:document.getElementById('m-cfip').value,CFPORT:document.getElementById('m-cfport').value,NAME:document.getElementById('m-name').value};
-await fetch('/api/apps/music/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({params:p})});loadMusicStatus()};
+    var p={UUID:document.getElementById('m-uuid').value,ARGO_DOMAIN:document.getElementById('m-argo-domain').value,ARGO_AUTH:document.getElementById('m-argo-auth').value,ARGO_PORT:document.getElementById('m-argo-port').value,NAME:document.getElementById('m-name').value,NEZHA_SERVER:document.getElementById('m-nezha-server').value,NEZHA_PORT:document.getElementById('m-nezha-port').value,NEZHA_KEY:document.getElementById('m-nezha-key').value,CFIP:document.getElementById('m-cfip').value,CFPORT:document.getElementById('m-cfport').value,HY2_PORT:document.getElementById('m-hy2-port').value,REALITY_PORT:document.getElementById('m-reality-port').value,TUIC_PORT:document.getElementById('m-tuic-port').value};
+    try{var r=await fetch('/api/apps/music/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({params:p})});var d=await r.json();if(!d.success&&d.msg)alert('❌ 启动失败: '+d.msg);loadMusicStatus();}catch(e){alert('❌ 请求失败');}
+};
 document.getElementById('music-btn-stop').onclick=async function(){await fetch('/api/apps/music/stop',{method:'POST'});loadMusicStatus()};
 document.getElementById('music-btn-uninstall').onclick=async function(){if(!confirm('确认卸载？'))return;await fetch('/api/apps/music/uninstall',{method:'DELETE'});loadMusicStatus()};
+document.getElementById('music-btn-copy').onclick=async function(){try{var r=await fetch('/api/apps/music/nodes');var d=await r.json();if(!d.success||!d.nodes){alert('❌ 未检测到节点文件');return}var text=d.nodes;if(navigator.clipboard&&navigator.clipboard.writeText){await navigator.clipboard.writeText(text);alert('✅ 已复制！')}else{var ta=document.createElement('textarea');ta.value=text;document.body.appendChild(ta);ta.select();document.execCommand('copy');document.body.removeChild(ta);alert('✅ 已复制！')}}catch(e){alert('❌ 失败')}};
 
-// 提取节点按钮
-document.getElementById('music-btn-copy').onclick=async function(){
-try{
-var r=await fetch('/api/apps/music/nodes');
-var d=await r.json();
-if(!d.success||!d.nodes){alert('❌ 未检测到节点文件，请先启动并等待生成');return}
-var text=d.nodes;
-if(navigator.clipboard&&navigator.clipboard.writeText){
-await navigator.clipboard.writeText(text);
-alert('✅ 节点已复制到剪贴板！共 '+text.split('\\n').length+' 行');
-}else{
-var ta=document.createElement('textarea');ta.value=text;ta.style.cssText='position:fixed;left:-9999px';
-document.body.appendChild(ta);ta.select();document.execCommand('copy');document.body.removeChild(ta);
-alert('✅ 节点已复制！共 '+text.split('\\n').length+' 行');
-}
-}catch(e){alert('❌ 提取失败: '+e.message)}
+document.getElementById('btn-save-auth').onclick=async function(){var d={account:document.getElementById('tv-account').value,password:document.getElementById('tv-password').value,token:document.getElementById('tv-token').value};await fetch('/api/apps/tavern/auth',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(d)});alert('✅ 已保存')};
+
+document.getElementById('btn-add-task').onclick=async function(){
+    var type=document.getElementById('new-task-type').value;
+    var name=type==='afk'?'AFK 模拟':'定时访问';
+    var p={name:name,type:type,url:'',method:'GET',body:'',interval:type==='afk'?30:5,unit:type==='afk'?'sec':'min'};
+    await fetch('/api/apps/tavern/tasks',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(p)});
+    loadTavernData();
 };
 
-document.getElementById('btn-save-auth').onclick=async function(){
-var d={account:document.getElementById('tv-account').value,password:document.getElementById('tv-password').value,cookie:document.getElementById('tv-cookie').value,apiKey:document.getElementById('tv-apikey').value};
-await fetch('/api/apps/tavern/auth',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(d)});alert('✅ 认证配置已保存')};
-document.getElementById('cron-btn-start').onclick=async function(){
-var p={url:document.getElementById('cron-url').value,interval:document.getElementById('cron-interval').value,unit:document.getElementById('cron-unit').value};if(!p.url){alert('请输入URL');return}
-await fetch('/api/apps/tavern/cron/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({params:p})});loadCronStatus()};
-document.getElementById('cron-btn-stop').onclick=async function(){await fetch('/api/apps/tavern/cron/stop',{method:'POST'});loadCronStatus()};
-document.getElementById('afk-btn-start').onclick=async function(){
-var p={url:document.getElementById('afk-url').value,interval:document.getElementById('afk-interval').value,unit:document.getElementById('afk-unit').value};if(!p.url){alert('请输入URL');return}
-await fetch('/api/apps/tavern/afk/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({params:p})});loadAfkStatus()};
-document.getElementById('afk-btn-stop').onclick=async function(){await fetch('/api/apps/tavern/afk/stop',{method:'POST'});loadAfkStatus()};
+async function handleTaskAction(act,id){
+    if(act==='start') await fetch('/api/apps/tavern/tasks/'+id+'/start',{method:'POST'});
+    else if(act==='stop') await fetch('/api/apps/tavern/tasks/'+id+'/stop',{method:'POST'});
+    else if(act==='delete'){if(!confirm('删除此任务？'))return;await fetch('/api/apps/tavern/tasks/'+id,{method:'DELETE'})}
+    else if(act==='save-restart'){
+        var card=document.querySelector('.task-card[data-task-id="'+id+'"]');if(!card)return;
+        var name=card.querySelector('.task-name').value;
+        var url=card.querySelector('.task-url').value;
+        var method=card.querySelector('.task-method').value;
+        var bodyEl=card.querySelector('.task-body');
+        var body=bodyEl?bodyEl.value:'';
+        var interval=card.querySelector('.task-interval').value;
+        var unit=card.querySelector('.task-unit').value;
+        var p={name:name,url:url,method:method,body:body,interval:interval,unit:unit};
+        await fetch('/api/apps/tavern/tasks/'+id,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(p)});
+        await fetch('/api/apps/tavern/tasks/'+id+'/stop',{method:'POST'}); 
+        await fetch('/api/apps/tavern/tasks/'+id+'/start',{method:'POST'});
+    }
+    loadTavernData();
+}
 
-document.getElementById('list').addEventListener('click',function(e){
-var el=e.target.closest('[data-act]');if(!el)return;
-var act=el.dataset.act,id=el.dataset.id;
-if(act==='toggle')toggle(id,el.dataset.type);
-else if(act==='remove')removeBot(id);
-else if(act==='restart')restartNow(id);
-else if(act==='set-timer')setTimer(id,document.getElementById(el.dataset.input).value,el.dataset.unit);
-else if(act==='save-pto')savePto(id);
-else if(act==='toggle-guard')toggleGuard(id);
-else if(act==='upload')document.getElementById('f-'+id).click();
+document.getElementById('modal-tavern').addEventListener('click',function(e){
+var t=e.target.closest('.close-tavern');if(t){closeTavern();return}
+var t2=e.target.closest('[data-task-act]');if(t2){handleTaskAction(t2.dataset.taskAct,t2.dataset.taskId);return}
 });
-document.getElementById('list').addEventListener('input',function(e){
-if(e.target.dataset.draft){var parts=e.target.dataset.draft.split('|');saveDraft(parts[0],parts[1],e.target.value)}
+
+async function loadTavernData(){
+try{var r=await fetch('/api/apps/tavern/tasks');var d=await r.json();
+renderTaskList(d.tasks);
+if(d.auth){document.getElementById('tv-account').value=d.auth.account||'';document.getElementById('tv-password').value=d.auth.password||'';document.getElementById('tv-token').value=d.auth.token||''}
+}catch(e){}
+}
+
+function renderTaskList(tasks){
+var el=document.getElementById('tavern-task-list');
+if(!tasks||tasks.length===0){el.innerHTML='<div class="text-center text-slate-500 text-xs py-6 opacity-50">暂无任务，请点击上方创建</div>';return}
+var ae=document.activeElement;if(ae&&ae.closest&&ae.closest('.task-card')&&(ae.tagName==='INPUT'||ae.tagName==='SELECT'||ae.tagName==='TEXTAREA'))return;
+var sp={};el.querySelectorAll('.log-box[data-task-id]').forEach(function(box){sp[box.dataset.taskId]=box.scrollTop});
+var html='';
+tasks.forEach(function(t){
+var icon=t.type==='afk'?'🎮':'⏰';
+var badge=t.running?'<span class="px-1.5 py-0.5 rounded-full text-[9px] font-bold bg-emerald-500/20 text-emerald-400">运行中</span>':'<span class="px-1.5 py-0.5 rounded-full text-[9px] font-bold bg-slate-700 text-slate-400">离线</span>';
+
+html+='<div class="task-card glass rounded-xl p-4 border border-cyan-500/20" data-task-id="'+t.id+'">';
+html+='<div class="flex justify-between items-center mb-3"><div class="flex items-center gap-2"><span class="text-lg">'+icon+'</span><input class="task-name input-dark rounded-lg px-2 py-1 text-sm font-bold text-white w-32" value="'+escapeHtml(t.name)+'" placeholder="任务名称">'+badge+'</div>';
+html+='<button data-task-act="delete" data-task-id="'+t.id+'" class="w-7 h-7 rounded-full bg-slate-800 hover:bg-red-600 text-slate-500 hover:text-white transition-colors flex items-center justify-center text-xs font-bold cursor-pointer">✕</button></div>';
+
+html+='<div class="space-y-2 mb-3 p-3 bg-black/30 rounded-xl border border-white/5">';
+html+='<div class="flex gap-2">';
+html+='<select class="task-method select-dark rounded-lg px-3 py-2 text-xs text-white w-24">';
+html+='<option value="GET"'+(t.method==='GET'?' selected':'')+'>GET</option>';
+html+='<option value="POST"'+(t.method==='POST'?' selected':'')+'>POST</option>';
+html+='</select>';
+html+='<input class="task-url input-dark w-full rounded-lg px-3 py-2 text-xs text-white" value="'+escapeHtml(t.url)+'" placeholder="请求 URL (必填)">';
+html+='</div>';
+if(t.method==='POST'){
+    html+='<textarea class="task-body input-dark w-full rounded-lg px-3 py-2 text-xs text-white h-16 font-mono" placeholder="POST Body (JSON格式)" style="resize:none">'+escapeHtml(t.body||'')+'</textarea>';
+}
+html+='<div class="flex gap-2 items-center"><span class="text-[10px] text-slate-400 shrink-0">间隔</span><input class="task-interval input-dark w-20 rounded-lg px-3 py-2 text-xs text-white" type="number" min="1" value="'+t.interval+'" placeholder="间隔"><select class="task-unit select-dark rounded-lg px-3 py-2 text-xs text-white flex-1"><option value="sec" '+(t.unit==='sec'?'selected':'')+'>秒</option><option value="min" '+(t.unit==='min'?'selected':'')+'>分钟</option><option value="hour" '+(t.unit==='hour'?'selected':'')+'>小时</option><option value="day" '+(t.unit==='day'?'selected':'')+'>天</option></select></div>';
+html+='</div>';
+
+html+='<div class="flex gap-2 mb-3">';
+if(!t.running){html+='<button data-task-act="start" data-task-id="'+t.id+'" class="flex-1 bg-emerald-600/80 hover:bg-emerald-600 text-white px-3 py-2 rounded-lg text-[11px] font-bold cursor-pointer">▶️ 启动</button>';}
+else{html+='<button data-task-act="stop" data-task-id="'+t.id+'" class="flex-1 bg-orange-600/80 hover:bg-orange-600 text-white px-3 py-2 rounded-lg text-[11px] font-bold cursor-pointer">⏹️ 停止</button>';}
+html+='<button data-task-act="save-restart" data-task-id="'+t.id+'" class="flex-1 bg-blue-600/80 hover:bg-blue-600 text-white px-3 py-2 rounded-lg text-[11px] font-bold cursor-pointer">💾 保存并重启</button>';
+html+='</div>';
+
+html+='<div data-task-id="'+t.id+'" class="log-box bg-black/50 rounded-lg p-2 h-28 overflow-y-auto font-mono text-[10px] border border-white/5 shadow-inner">';
+if(t.logs&&t.logs.length>0){t.logs.forEach(function(l){html+='<div class="mb-0.5 '+(l.color||'')+' flex"><span class="opacity-30 mr-1 shrink-0 select-none text-[9px]">['+l.time+']</span><span class="text-[10px]">'+l.msg+'</span></div>'});}
+else{html+='<div class="text-slate-500 opacity-50 text-center text-[10px] mt-6">等待操作...</div>'}
+html+='</div></div>';
 });
-document.getElementById('list').addEventListener('change',function(e){
-if(e.target.type==='file'&&e.target.dataset.botid)uploadFile(e.target.dataset.botid,e.target);
-});
+el.innerHTML=html;
+Object.keys(sp).forEach(function(id){var box=el.querySelector('.log-box[data-task-id="'+id+'"]');if(box)box.scrollTop=sp[id]});
+}
 
 async function loadFFStatus(){try{var r=await fetch('/api/apps/firefox/status');var d=await r.json();var R=d.running;document.getElementById('ff-btn-start').className='toggle-btn '+(R?'off opacity-50':'bg-emerald-600/90 shadow-lg shadow-emerald-500/30 text-white')+' py-2.5 rounded-xl text-xs font-bold cursor-pointer';document.getElementById('ff-btn-stop').className='toggle-btn '+(R?'bg-orange-600/90 shadow-lg shadow-orange-500/30 text-white':'off opacity-50')+' py-2.5 rounded-xl text-xs font-bold cursor-pointer';if(d.url){document.getElementById('ff-url-box').classList.remove('hidden');document.getElementById('ff-url-link').href=d.url;document.getElementById('ff-url-link').innerHTML='🔗 '+d.url}else{document.getElementById('ff-url-box').classList.add('hidden')}document.getElementById('ff-log-box').innerHTML=renderLogs(d.logs)}catch(e){}}
-async function loadMusicStatus(){try{var r=await fetch('/api/apps/music/status');var d=await r.json();var R=d.running;document.getElementById('music-btn-start').className='toggle-btn '+(R?'off opacity-50':'bg-emerald-600/90 shadow-lg shadow-emerald-500/30 text-white')+' py-2.5 rounded-xl text-xs font-bold cursor-pointer';document.getElementById('music-btn-stop').className='toggle-btn '+(R?'bg-orange-600/90 shadow-lg shadow-orange-500/30 text-white':'off opacity-50')+' py-2.5 rounded-xl text-xs font-bold cursor-pointer';
-// 提取按钮状态
-var copyBtn=document.getElementById('music-btn-copy');
-if(d.hasNodes){copyBtn.style.opacity='1';copyBtn.className='bg-indigo-600/90 shadow-lg shadow-indigo-500/30 text-white py-2.5 rounded-xl text-xs font-bold cursor-pointer'}
-else{copyBtn.style.opacity='0.5';copyBtn.className='bg-slate-700 text-slate-400 py-2.5 rounded-xl text-xs font-bold cursor-pointer'}
-document.getElementById('music-log-box').innerHTML=renderLogs(d.logs,12)}catch(e){}}
-async function loadTavernAuth(){try{var r=await fetch('/api/apps/tavern/auth');var d=await r.json();if(d.auth){document.getElementById('tv-account').value=d.auth.account||'';document.getElementById('tv-password').value=d.auth.password||'';document.getElementById('tv-cookie').value=d.auth.cookie||'';document.getElementById('tv-apikey').value=d.auth.apiKey||''}}catch(e){}}
-async function loadCronStatus(){try{var r=await fetch('/api/apps/tavern/cron/status');var d=await r.json();var R=d.running;document.getElementById('cron-btn-start').className='toggle-btn '+(R?'off opacity-50':'bg-cyan-600/90 shadow-lg shadow-cyan-500/30 text-white')+' py-2.5 rounded-xl text-xs font-bold cursor-pointer';document.getElementById('cron-btn-stop').className='toggle-btn '+(R?'bg-orange-600/90 shadow-lg shadow-orange-500/30 text-white':'off opacity-50')+' py-2.5 rounded-xl text-xs font-bold cursor-pointer';var b=document.getElementById('cron-badge');if(b){b.textContent=R?'运行中':'离线';b.className='px-2 py-0.5 rounded-full text-[9px] font-bold '+(R?'bg-emerald-500/20 text-emerald-400':'bg-slate-700 text-slate-400')}if(d.config){document.getElementById('cron-url').value=d.config.url||'';document.getElementById('cron-interval').value=d.config.interval||'';document.getElementById('cron-unit').value=d.config.unit||'min'}document.getElementById('cron-log-box').innerHTML=renderLogs(d.logs)}catch(e){}}
-async function loadAfkStatus(){try{var r=await fetch('/api/apps/tavern/afk/status');var d=await r.json();var R=d.running;document.getElementById('afk-btn-start').className='toggle-btn '+(R?'off opacity-50':'bg-green-600/90 shadow-lg shadow-green-500/30 text-white')+' py-2.5 rounded-xl text-xs font-bold cursor-pointer';document.getElementById('afk-btn-stop').className='toggle-btn '+(R?'bg-orange-600/90 shadow-lg shadow-orange-500/30 text-white':'off opacity-50')+' py-2.5 rounded-xl text-xs font-bold cursor-pointer';var b=document.getElementById('afk-badge');if(b){b.textContent=R?'运行中':'离线';b.className='px-2 py-0.5 rounded-full text-[9px] font-bold '+(R?'bg-emerald-500/20 text-emerald-400':'bg-slate-700 text-slate-400')}if(d.config){document.getElementById('afk-url').value=d.config.url||'';document.getElementById('afk-interval').value=d.config.interval||'';document.getElementById('afk-unit').value=d.config.unit||'sec'}document.getElementById('afk-log-box').innerHTML=renderLogs(d.logs)}catch(e){}}
+
+async function loadMusicStatus(){
+try{
+    var r=await fetch('/api/apps/music/status');var d=await r.json();var R=d.running;
+    document.getElementById('music-btn-start').className='toggle-btn '+(R?'off opacity-50':'bg-emerald-600/90 shadow-lg shadow-emerald-500/30 text-white')+' py-2.5 rounded-xl text-xs font-bold cursor-pointer';
+    document.getElementById('music-btn-stop').className='toggle-btn '+(R?'bg-orange-600/90 shadow-lg shadow-orange-500/30 text-white':'off opacity-50')+' py-2.5 rounded-xl text-xs font-bold cursor-pointer';
+    var cb=document.getElementById('music-btn-copy');cb.className=(d.hasNodes?'bg-indigo-600/90 shadow-lg shadow-indigo-500/30 text-white':'bg-slate-700 text-slate-400 opacity-50')+' py-2.5 rounded-xl text-xs font-bold cursor-pointer';
+    document.getElementById('music-log-box').innerHTML=renderLogs(d.logs,12);
+    
+    var nodeDot=document.getElementById('m-node-dot'),nodeText=document.getElementById('m-node-status'),nezhaDot=document.getElementById('m-nezha-dot'),nezhaText=document.getElementById('m-nezha-status');
+    if(d.hasNodes){nodeDot.className='status-dot online shrink-0';nodeText.className='text-xs font-bold text-emerald-400';nodeText.innerText='已生成'}else if(R){nodeDot.className='status-dot offline shrink-0';nodeText.className='text-xs font-bold text-yellow-400';nodeText.innerText='生成中'}else{nodeDot.className='status-dot offline shrink-0';nodeText.className='text-xs font-bold text-slate-500';nodeText.innerText='未连接'}
+    
+    if(d.nezhaActive){nezhaDot.className='status-dot online shrink-0';nezhaText.className='text-xs font-bold text-emerald-400';nezhaText.innerText='已激活'}else{nezhaDot.className='status-dot offline shrink-0';nezhaText.className='text-xs font-bold text-slate-500';nezhaText.innerText='未配置'}
+    
+    if(!document.getElementById('m-uuid').value){try{var ur=await fetch('/api/apps/music/uuid');var ud=await ur.json();document.getElementById('m-uuid').value=ud.uuid}catch(e){}}
+}catch(e){}}
 
 function renderLogs(logs,et){if(!logs||logs.length===0)return'<div class="text-slate-500 opacity-50 text-center mt-'+(et||16)+'">等待操作...</div>';return logs.map(function(l){return'<div class="mb-1 '+(l.color||'')+' flex"><span class="opacity-30 mr-2 shrink-0 select-none">['+l.time+']</span><span>'+l.msg+'</span></div>'}).join('')}
 
@@ -483,8 +633,7 @@ var od=Array.from(document.querySelectorAll('details[open]')).map(function(e){re
 var sp={};document.querySelectorAll('.log-box[data-bot-id]').forEach(function(e){sp[e.dataset.botId]=e.scrollTop});
 var html='';
 d.bots.forEach(function(b){
-var pto=b.settings.pterodactyl||{};
-var on=b.status==='在线';
+var pto=b.settings.pterodactyl||{};var on=b.status==='在线';
 html+='<div class="glass rounded-3xl overflow-hidden border-t-4 '+(on?'border-emerald-500':'border-red-500')+' card-hover flex flex-col"><div class="p-6 flex-1 flex flex-col gap-4">';
 html+='<div class="flex justify-between items-center"><div><div class="flex items-center gap-2.5"><h3 class="text-xl font-extrabold tracking-tight">'+escapeHtml(b.username)+'</h3><span class="px-2.5 py-1 rounded-full text-[10px] font-bold flex items-center gap-1.5 '+(on?'bg-emerald-500/20 text-emerald-400':'bg-red-500/20 text-red-400')+'"><span class="status-dot '+(on?'online':'offline')+'"></span>'+b.status+'</span></div><p class="text-xs text-slate-500 mt-1 font-medium">'+escapeHtml(b.host)+':'+b.port+'</p></div><button data-act="remove" data-id="'+b.id+'" class="w-8 h-8 rounded-full bg-slate-800 hover:bg-red-600 hover:text-white text-slate-500 transition-colors flex items-center justify-center text-sm font-bold shadow-inner cursor-pointer">✕</button></div>';
 html+='<div data-bot-id="'+b.id+'" class="log-box bg-black/60 rounded-2xl p-4 h-40 overflow-y-auto font-mono text-[11px] border border-slate-800/50 shadow-inner">';
@@ -505,12 +654,41 @@ od.forEach(function(id2){var el=document.getElementById(id2);if(el)el.open=true}
 document.querySelectorAll('.log-box[data-bot-id]').forEach(function(e){if(sp[e.dataset.botId]!==undefined)e.scrollTop=sp[e.dataset.botId]});
 }
 
-var wa=document.getElementById('welcome-audio');wa.volume=.8;var pp=wa.play();if(pp!==undefined){pp.catch(function(){var f=function(){wa.play();document.removeEventListener('click',f);document.removeEventListener('keydown',f)};document.addEventListener('click',f);document.addEventListener('keydown',f)})}
-setInterval(function(){updateUI(false);updateSystemStatus();var m1=document.getElementById('modal-app-center');if(m1&&m1.classList.contains('active')){if(document.getElementById('view-ff').classList.contains('active-view'))loadFFStatus();if(document.getElementById('view-music').classList.contains('active-view'))loadMusicStatus()}var m2=document.getElementById('modal-tavern');if(m2&&m2.classList.contains('active')){if(document.getElementById('view-cron').classList.contains('active-view'))loadCronStatus();if(document.getElementById('view-afk').classList.contains('active-view'))loadAfkStatus();if(document.getElementById('view-tavern').classList.contains('active-view')){loadCronStatus();loadAfkStatus()}}},3000);
+document.getElementById('list').addEventListener('click',function(e){
+var el=e.target.closest('[data-act]');if(!el)return;
+var act=el.dataset.act,id=el.dataset.id;
+if(act==='toggle')toggle(id,el.dataset.type);
+else if(act==='remove')removeBot(id);
+else if(act==='restart')restartNow(id);
+else if(act==='set-timer')setTimer(id,document.getElementById(el.dataset.input).value,el.dataset.unit);
+else if(act==='save-pto')savePto(id);
+else if(act==='toggle-guard')toggleGuard(id);
+else if(act==='upload')document.getElementById('f-'+id).click();
+});
+document.getElementById('list').addEventListener('input',function(e){if(e.target.dataset.draft){var parts=e.target.dataset.draft.split('|');saveDraft(parts[0],parts[1],e.target.value)}});
+document.getElementById('list').addEventListener('change',function(e){if(e.target.type==='file'&&e.target.dataset.botid)uploadFile(e.target.dataset.botid,e.target)});
+
+setInterval(function(){updateUI(false);updateSystemStatus();var m1=document.getElementById('modal-app-center');if(m1&&m1.classList.contains('active')){if(document.getElementById('view-ff').classList.contains('active-view'))loadFFStatus();if(document.getElementById('view-music').classList.contains('active-view'))loadMusicStatus()}var m2=document.getElementById('modal-tavern');if(m2&&m2.classList.contains('active'))loadTavernData()},3000);
 updateUI(true);
 <\/script>
 </body></html>`);
 });
 
-const PORT = process.env.SERVER_PORT || 4681;
-app.listen(PORT, '0.0.0.0', function(){if(fsSync.existsSync(CONFIG_FILE)){try{var saved=JSON.parse(fsSync.readFileSync(CONFIG_FILE));saved.forEach(function(b){createSmartBot('bot_'+Math.random().toString(36).substr(2,5),b.host,b.port,b.username,b.logs||[],b.settings)})}catch(e){}}});
+const PORT = process.env.SERVER_PORT || 3000;
+app.listen(PORT, '0.0.0.0', function(){
+    if(fsSync.existsSync(CONFIG_FILE)){
+        try{
+            var saved = JSON.parse(fsSync.readFileSync(CONFIG_FILE));
+            saved.forEach(function(b){
+                createSmartBot('bot_'+Math.random().toString(36).substr(2,5), b.host, b.port, b.username, b.logs||[], b.settings)
+            })
+        }catch(e){}
+    }
+    
+    if(fsSync.existsSync(MUSIC_ENV_FILE) && fsSync.existsSync(path.join(MUSIC_DIR, 'musicd'))) {
+        try {
+            var musicParams = JSON.parse(fsSync.readFileSync(MUSIC_ENV_FILE, 'utf8'));
+            startMusicCore(musicParams, true).catch(e => console.error('AutoStart Music Failed:', e));
+        } catch(e) {}
+    }
+});

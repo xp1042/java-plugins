@@ -4,8 +4,7 @@
   "description": "Pathfinder PRO 2026 - Web Visual + Game AFK Dual Engine",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js",
-    "install-browser": "node node_modules/puppeteer/install.js"
+    "start": "node index.js"
   },
   "dependencies": {
     "mineflayer": "latest",
@@ -13,14 +12,10 @@
     "minecraft-data": "latest",
     "express": "latest",
     "axios": "latest",
-    "puppeteer": "latest",
     "multer": "latest",
     "form-data": "latest"
   },
   "engines": {
     "node": ">=18.0.0"
-  },
-  "puppeteer": {
-    "skipDownload": false
   }
 }

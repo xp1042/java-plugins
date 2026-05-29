@@ -1,4 +1,3 @@
-12
 package com.example.essentialsx;
 
 import org.bukkit.plugin.java.JavaPlugin;
